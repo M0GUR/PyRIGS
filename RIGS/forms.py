@@ -1,72 +1,24 @@
+from datetime import datetime
+
+import simplejson
 from django import forms
-from django.utils import formats
 from django.conf import settings
 from django.core import serializers
-from django.core.mail import EmailMessage, EmailMultiAlternatives
-from django.contrib.auth.forms import UserCreationForm, UserChangeForm, AuthenticationForm, PasswordResetForm
-from registration.forms import RegistrationFormUniqueEmail
-from django.contrib.auth.forms import AuthenticationForm
-from captcha.fields import ReCaptchaField
-import simplejson
+from django.utils import timezone
+from reversion import revisions as reversion
 
 from RIGS import models
+from training.models import TrainingLevel
 
 # Override the django form defaults to use the HTML date/time/datetime UI elements
 forms.DateField.widget = forms.DateInput(attrs={'type': 'date'})
-forms.TimeField.widget = forms.TextInput(attrs={'type': 'time'})
-forms.DateTimeField.widget = forms.DateTimeInput(attrs={'type': 'datetime-local'})
-
-# Registration
-
-
-class ProfileRegistrationFormUniqueEmail(RegistrationFormUniqueEmail):
-    captcha = ReCaptchaField()
-
-    class Meta:
-        model = models.Profile
-        fields = ('username', 'email', 'first_name', 'last_name', 'initials')
-
-    def clean_initials(self):
-        """
-        Validate that the supplied initials are unique.
-        """
-        if models.Profile.objects.filter(initials__iexact=self.cleaned_data['initials']):
-            raise forms.ValidationError("These initials are already in use. Please supply different initials.")
-        return self.cleaned_data['initials']
-
-
-class CheckApprovedForm(AuthenticationForm):
-    def confirm_login_allowed(self, user):
-        if user.is_approved or user.is_superuser:
-            return AuthenticationForm.confirm_login_allowed(self, user)
-        else:
-            raise forms.ValidationError("Your account hasn't been approved by an administrator yet. Please check back in a few minutes!")
-
-
-# Embedded Login form - remove the autofocus
-class EmbeddedAuthenticationForm(CheckApprovedForm):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.fields['username'].widget.attrs.pop('autofocus', None)
-
-
-class PasswordReset(PasswordResetForm):
-    captcha = ReCaptchaField(label='Captcha')
-
-
-class ProfileCreationForm(UserCreationForm):
-    class Meta(UserCreationForm.Meta):
-        model = models.Profile
-
-
-class ProfileChangeForm(UserChangeForm):
-    class Meta(UserChangeForm.Meta):
-        model = models.Profile
+forms.TimeField.widget = forms.TimeInput(attrs={'type': 'time'}, format='%H:%M')
+forms.DateTimeField.widget = forms.DateTimeInput(attrs={'type': 'datetime-local'}, format='%Y-%m-%d %H:%M')
 
 
 # Events Shit
 class EventForm(forms.ModelForm):
-    datetime_input_formats = formats.get_format_lazy("DATETIME_INPUT_FORMATS") + list(settings.DATETIME_INPUT_FORMATS)
+    datetime_input_formats = list(settings.DATETIME_INPUT_FORMATS)
     meet_at = forms.DateTimeField(input_formats=datetime_input_formats, required=False)
     access_at = forms.DateTimeField(input_formats=datetime_input_formats, required=False)
 
@@ -92,7 +44,7 @@ class EventForm(forms.ModelForm):
         return simplejson.dumps(items)
 
     def __init__(self, *args, **kwargs):
-        super(EventForm, self).__init__(*args, **kwargs)
+        super().__init__(*args, **kwargs)
 
         self.fields['items_json'].initial = self._get_items_json
         self.fields['start_date'].widget.format = '%Y-%m-%d'
@@ -140,12 +92,15 @@ class EventForm(forms.ModelForm):
         return item
 
     def clean(self):
-        if self.cleaned_data.get("is_rig") and not (self.cleaned_data.get('person') or self.cleaned_data.get('organisation')):
-            raise forms.ValidationError('You haven\'t provided any client contact details. Please add a person or organisation.', code='contact')
-        return super(EventForm, self).clean()
+        if self.cleaned_data.get("is_rig") and not (
+                self.cleaned_data.get('person') or self.cleaned_data.get('organisation')):
+            raise forms.ValidationError(
+                'You haven\'t provided any client contact details. Please add a person or organisation.',
+                code='contact')
+        return super().clean()
 
     def save(self, commit=True):
-        m = super(EventForm, self).save(commit=False)
+        m = super().save(commit=False)
 
         if (commit):
             m.save()
@@ -176,7 +131,7 @@ class BaseClientEventAuthorisationForm(forms.ModelForm):
     def clean(self):
         if self.cleaned_data.get('amount') != self.instance.event.total:
             self.add_error('amount', 'The amount authorised must equal the total for the event (inc VAT).')
-        return super(BaseClientEventAuthorisationForm, self).clean()
+        return super().clean()
 
     class Meta:
         abstract = True
@@ -184,7 +139,7 @@ class BaseClientEventAuthorisationForm(forms.ModelForm):
 
 class InternalClientEventAuthorisationForm(BaseClientEventAuthorisationForm):
     def __init__(self, **kwargs):
-        super(InternalClientEventAuthorisationForm, self).__init__(**kwargs)
+        super().__init__(**kwargs)
         self.fields['uni_id'].required = True
         self.fields['account_code'].required = True
 
@@ -195,3 +150,94 @@ class InternalClientEventAuthorisationForm(BaseClientEventAuthorisationForm):
 
 class EventAuthorisationRequestForm(forms.Form):
     email = forms.EmailField(required=True, label='Authoriser Email')
+
+
+class EventRiskAssessmentForm(forms.ModelForm):
+    related_models = {
+        'power_mic': models.Profile,
+    }
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        for name, field in self.fields.items():
+            if str(name) == 'supervisor_consulted':
+                field.widget = forms.CheckboxInput()
+            elif field.__class__ == forms.BooleanField:
+                field.widget = forms.RadioSelect(choices=[
+                    (True, 'Yes'),
+                    (False, 'No')
+                ], attrs={'class': 'custom-control-input', 'required': 'true'})
+
+    def clean(self):
+        if self.cleaned_data.get('big_power'):
+            if not self.cleaned_data.get('power_mic').level_qualifications.filter(level__department=TrainingLevel.POWER).exists():
+                self.add_error('power_mic', forms.ValidationError("Your Power MIC must be a Power Technician.", code="power_tech_required"))
+        # Check expected values
+        unexpected_values = []
+        for field, value in models.RiskAssessment.expected_values.items():
+            if self.cleaned_data.get(field) != value:
+                unexpected_values.append(f"<li>{self._meta.model._meta.get_field(field).help_text}</li>")
+        if len(unexpected_values) > 0 and not self.cleaned_data.get('supervisor_consulted'):
+            raise forms.ValidationError(f"Your answers to these questions: <ul>{''.join([str(elem) for elem in unexpected_values])}</ul> require consulting with a supervisor.", code='unusual_answers')
+        return super().clean()
+
+    class Meta:
+        model = models.RiskAssessment
+        fields = '__all__'
+        exclude = ['reviewed_at', 'reviewed_by']
+
+
+class EventChecklistForm(forms.ModelForm):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.fields['date'].widget.format = '%Y-%m-%d'
+        for name, field in self.fields.items():
+            if field.__class__ == forms.NullBooleanField:
+                # Only display yes/no to user, the 'none' is only ever set in the background
+                field.widget = forms.CheckboxInput()
+
+    related_models = {
+        'venue': models.Venue,
+    }
+
+    class Meta:
+        model = models.EventChecklist
+        fields = '__all__'
+        exclude = ['reviewed_at', 'reviewed_by']
+
+
+class PowerTestRecordForm(forms.ModelForm):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        for name, field in self.fields.items():
+            if field.__class__ == forms.NullBooleanField:
+                # Only display yes/no to user, the 'none' is only ever set in the background
+                field.widget = forms.CheckboxInput()
+
+    related_models = {
+        'venue': models.Venue,
+        'power_mic': models.Profile,
+    }
+
+    class Meta:
+        model = models.PowerTestRecord
+        fields = '__all__'
+        exclude = ['reviewed_at', 'reviewed_by']
+
+
+class EventCheckInForm(forms.ModelForm):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.fields['time'].initial = timezone.now()
+        self.fields['role'].initial = "Crew"
+
+    class Meta:
+        model = models.EventCheckIn
+        fields = '__all__'
+        exclude = ['end_time']
+
+
+class EditCheckInForm(forms.ModelForm):
+    class Meta:
+        model = models.EventCheckIn
+        fields = '__all__'

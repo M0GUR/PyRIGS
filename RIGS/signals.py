@@ -1,20 +1,21 @@
-import datetime
 import re
-import urllib.request
 import urllib.error
 import urllib.parse
+import urllib.request
 from io import BytesIO
 
-from django.db.models.signals import post_save
 from PyPDF2 import PdfFileReader, PdfFileMerger
 from django.conf import settings
-from django.contrib.staticfiles.storage import staticfiles_storage
+from django.contrib.staticfiles import finders
+from django.core.cache import cache
 from django.core.mail import EmailMessage, EmailMultiAlternatives
+from django.db.models.signals import post_save
 from django.template.loader import get_template
 from django.urls import reverse
 from django.utils import timezone
-from registration.signals import user_activated
 from premailer import Premailer
+from registration.signals import user_activated
+from reversion import revisions as reversion
 from z3c.rml import rml2pdf
 
 from RIGS import models
@@ -24,17 +25,11 @@ def send_eventauthorisation_success_email(instance):
     # Generate PDF first to prevent context conflicts
     context = {
         'object': instance.event,
-        'fonts': {
-            'opensans': {
-                'regular': 'RIGS/static/fonts/OPENSANS-REGULAR.TTF',
-                'bold': 'RIGS/static/fonts/OPENSANS-BOLD.TTF',
-            }
-        },
         'receipt': True,
         'current_user': False,
     }
 
-    template = get_template('RIGS/event_print.xml')
+    template = get_template('event_print.xml')
     merger = PdfFileMerger()
 
     rml = template.render(context)
@@ -59,23 +54,23 @@ def send_eventauthorisation_success_email(instance):
     elif instance.event.organisation is not None and instance.email == instance.event.organisation.email:
         context['to_name'] = instance.event.organisation.name
 
-    subject = "N%05d | %s - Event Authorised" % (instance.event.pk, instance.event.name)
+    subject = f"{instance.event.display_id} | {instance.event.name} - Event Authorised"
 
     client_email = EmailMultiAlternatives(
         subject,
-        get_template("RIGS/eventauthorisation_client_success.txt").render(context),
+        get_template("email/eventauthorisation_client_success.txt").render(context),
         to=[instance.email],
         reply_to=[settings.AUTHORISATION_NOTIFICATION_ADDRESS],
     )
 
-    css = staticfiles_storage.path('css/email.css')
-    html = Premailer(get_template("RIGS/eventauthorisation_client_success.html").render(context),
+    css = finders.find('css/email.css')
+    html = Premailer(get_template("email/eventauthorisation_client_success.html").render(context),
                      external_styles=css).transform()
     client_email.attach_alternative(html, 'text/html')
 
     escapedEventName = re.sub(r'[^a-zA-Z0-9 \n\.]', '', instance.event.name)
 
-    client_email.attach('N%05d - %s - CONFIRMATION.pdf' % (instance.event.pk, escapedEventName),
+    client_email.attach(f'{instance.event.display_id} - {escapedEventName} - CONFIRMATION.pdf',
                         merged.getvalue(),
                         'application/pdf'
                         )
@@ -87,7 +82,7 @@ def send_eventauthorisation_success_email(instance):
 
     mic_email = EmailMessage(
         subject,
-        get_template("RIGS/eventauthorisation_mic_success.txt").render(context),
+        get_template("email/eventauthorisation_mic_success.txt").render(context),
         to=[mic_email_address]
     )
 
@@ -121,13 +116,13 @@ def send_admin_awaiting_approval_email(user, request, **kwargs):
             }
 
             email = EmailMultiAlternatives(
-                "%s new users awaiting approval on RIGS" % (context['number_of_users']),
-                get_template("RIGS/admin_awaiting_approval.txt").render(context),
+                f"{context['number_of_users']} new users awaiting approval on RIGS",
+                get_template("email/admin_awaiting_approval.txt").render(context),
                 to=[admin.email],
                 reply_to=[user.email],
             )
-            css = staticfiles_storage.path('css/email.css')
-            html = Premailer(get_template("RIGS/admin_awaiting_approval.html").render(context),
+            css = finders.find('css/email.css')
+            html = Premailer(get_template("email/admin_awaiting_approval.html").render(context),
                              external_styles=css).transform()
             email.attach_alternative(html, 'text/html')
             email.send()
@@ -138,3 +133,11 @@ def send_admin_awaiting_approval_email(user, request, **kwargs):
 
 
 user_activated.connect(send_admin_awaiting_approval_email)
+
+
+def update_cache(sender, instance, created, **kwargs):
+    cache.clear()
+
+
+for model in reversion.get_registered_models():
+    post_save.connect(update_cache, sender=model)

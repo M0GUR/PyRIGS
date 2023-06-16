@@ -1,4 +1,5 @@
 from django import forms
+from django.db.models import Q
 
 from assets import models
 
@@ -12,7 +13,7 @@ class AssetForm(forms.ModelForm):
     class Meta:
         model = models.Asset
         fields = '__all__'
-        exclude = ['asset_id_prefix', 'asset_id_number']
+        exclude = ['asset_id_prefix', 'asset_id_number', 'last_audited_at', 'last_audited_by']
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -20,10 +21,20 @@ class AssetForm(forms.ModelForm):
         self.fields['date_acquired'].widget.format = '%Y-%m-%d'
 
 
+class AssetAuditForm(AssetForm):
+    class Meta(AssetForm.Meta):
+        # Prevents assets losing existing data that isn't included in the audit form
+        exclude = ['asset_id_prefix', 'asset_id_number', 'last_audited_at', 'last_audited_by',
+                   'parent', 'purchased_from', 'purchase_price', 'comments']
+
+
 class AssetSearchForm(forms.Form):
-    query = forms.CharField(required=False)
+    q = forms.CharField(required=False)
     category = forms.ModelMultipleChoiceField(models.AssetCategory.objects.all(), required=False)
     status = forms.ModelMultipleChoiceField(models.AssetStatus.objects.all(), required=False)
+    is_cable = forms.BooleanField(required=False)
+    cable_type = forms.ModelMultipleChoiceField(models.CableType.objects.all(), required=False)
+    date_acquired = forms.DateField(required=False)
 
 
 class SupplierForm(forms.ModelForm):
@@ -32,5 +43,7 @@ class SupplierForm(forms.ModelForm):
         fields = '__all__'
 
 
-class SupplierSearchForm(forms.Form):
-    query = forms.CharField(required=False)
+class CableTypeForm(forms.ModelForm):
+    class Meta:
+        model = models.CableType
+        fields = '__all__'

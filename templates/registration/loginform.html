@@ -1,6 +1,11 @@
 {% load widget_tweaks %}
 {% include 'form_errors.html' %}
-<div class="col-sm-6 col-sm-offset-3 col-lg-4 col-lg-offset-4">
+{% if form.errors %}
+	<div class="alert alert-info">
+		<p><strong>Please note:</strong> If it has been more than a year since you last logged in, your account will have been automatically deactivated. Contact <a href="mailto:it@nottinghamtec.co.uk">it@nottinghamtec.co.uk</a> for assistance.</p>
+	</div>
+{% endif %}
+<div class="col-sm-6 offset-sm-3 col-lg-4 offset-lg-4">
     <form action="{% url 'login' %}" method="post" role="form" target="_self">{% csrf_token %}
         <div class="form-group">
             <label for="id_username">{{ form.username.label }}</label>

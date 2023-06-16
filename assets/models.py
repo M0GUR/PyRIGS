@@ -1,39 +1,38 @@
 import re
+
 from django.core.exceptions import ValidationError
 from django.db import models, connection
+from django.db.models import Q
 from django.urls import reverse
-
-from django.db.models.signals import pre_save
-from django.dispatch.dispatcher import receiver
-
 from reversion import revisions as reversion
 from reversion.models import Version
 
-from RIGS.models import RevisionMixin
+from RIGS.models import Profile, ContactableManager
+from versioning.versioning import RevisionMixin
 
 
 class AssetCategory(models.Model):
+    name = models.CharField(max_length=80)
+
     class Meta:
         verbose_name = 'Asset Category'
         verbose_name_plural = 'Asset Categories'
         ordering = ['name']
-
-    name = models.CharField(max_length=80)
 
     def __str__(self):
         return self.name
 
 
 class AssetStatus(models.Model):
+    name = models.CharField(max_length=80)
+    should_show = models.BooleanField(
+        default=True, help_text="Should this be shown by default in the asset list.")
+    display_class = models.CharField(max_length=80, blank=True, help_text="HTML class to be appended to alter display of assets with this status, such as in the list.")
+
     class Meta:
         verbose_name = 'Asset Status'
         verbose_name_plural = 'Asset Statuses'
         ordering = ['name']
-
-    name = models.CharField(max_length=80)
-    should_show = models.BooleanField(
-        default=True, help_text="Should this be shown by default in the asset list.")
-    display_class = models.CharField(max_length=80, blank=True, null=True, help_text="HTML class to be appended to alter display of assets with this status, such as in the list.")
 
     def __str__(self):
         return self.name
@@ -41,13 +40,20 @@ class AssetStatus(models.Model):
 
 @reversion.register
 class Supplier(models.Model, RevisionMixin):
+    name = models.CharField(max_length=80)
+    phone = models.CharField(max_length=15, blank=True, default="")
+    email = models.EmailField(blank=True, default="")
+    address = models.TextField(blank=True, default="")
+
+    notes = models.TextField(blank=True, default="")
+
+    objects = ContactableManager()
+
     class Meta:
         ordering = ['name']
 
-    name = models.CharField(max_length=80)
-
     def get_absolute_url(self):
-        return reverse('supplier_list')
+        return reverse('supplier_detail', kwargs={'pk': self.pk})
 
     def __str__(self):
         return self.name
@@ -63,14 +69,50 @@ class Connector(models.Model):
         return self.description
 
 
+class CableType(models.Model):
+    circuits = models.IntegerField(default=1)
+    cores = models.IntegerField(default=3)
+    plug = models.ForeignKey(Connector, on_delete=models.CASCADE,
+                             related_name='plug')
+    socket = models.ForeignKey(Connector, on_delete=models.CASCADE,
+                               related_name='socket')
+
+    class Meta:
+        ordering = ['plug', 'socket', '-circuits']
+        unique_together = ['plug', 'socket', 'circuits', 'cores']
+
+    def __str__(self):
+        if self.plug and self.socket:
+            return f"{self.plug.description} → {self.socket.description}"
+        else:
+            return "Unknown"
+
+    def get_absolute_url(self):
+        return reverse('cable_type_detail', kwargs={'pk': self.pk})
+
+
+class AssetManager(models.Manager):
+    def search(self, query=None):
+        qs = self.get_queryset()
+        if query is not None:
+            or_lookup = (Q(asset_id__exact=query.upper()) | Q(description__icontains=query) | Q(serial_number__exact=query) | Q(nickname__icontains=query))
+            qs = qs.filter(or_lookup).distinct()  # distinct() is often necessary with Q lookups
+        return qs
+
+
+def get_available_asset_id(wanted_prefix=""):
+    last_asset = Asset.objects.filter(asset_id_prefix=wanted_prefix).last()
+    last_asset_id = last_asset.asset_id_number if last_asset else 0
+    return wanted_prefix + str(last_asset_id + 1)
+
+
+def validate_positive(value):
+    if value < 0:
+        raise ValidationError("A price cannot be negative")
+
+
 @reversion.register
 class Asset(models.Model, RevisionMixin):
-    class Meta:
-        ordering = ['asset_id_prefix', 'asset_id_number']
-        permissions = [
-            ('asset_finance', 'Can see financial data for assets')
-        ]
-
     parent = models.ForeignKey(to='self', related_name='asset_parent',
                                blank=True, null=True, on_delete=models.SET_NULL)
     asset_id = models.CharField(max_length=15, unique=True)
@@ -78,57 +120,46 @@ class Asset(models.Model, RevisionMixin):
     category = models.ForeignKey(to=AssetCategory, on_delete=models.CASCADE)
     status = models.ForeignKey(to=AssetStatus, on_delete=models.CASCADE)
     serial_number = models.CharField(max_length=150, blank=True)
-    purchased_from = models.ForeignKey(to=Supplier, on_delete=models.CASCADE, blank=True, null=True, related_name="assets")
+    purchased_from = models.ForeignKey(to=Supplier, on_delete=models.SET_NULL, blank=True, null=True, related_name="assets")
     date_acquired = models.DateField()
     date_sold = models.DateField(blank=True, null=True)
-    purchase_price = models.DecimalField(blank=True, null=True, decimal_places=2, max_digits=10)
-    salvage_value = models.DecimalField(blank=True, null=True, decimal_places=2, max_digits=10)
+    purchase_price = models.DecimalField(blank=True, null=True, decimal_places=2, max_digits=10, validators=[validate_positive])
+    replacement_cost = models.DecimalField(null=True, decimal_places=2, max_digits=10, validators=[validate_positive])
     comments = models.TextField(blank=True)
-    next_sched_maint = models.DateField(blank=True, null=True)
+    nickname = models.CharField(max_length=120, blank=True)
+
+    # Audit
+    last_audited_at = models.DateTimeField(blank=True, null=True)
+    last_audited_by = models.ForeignKey(Profile, on_delete=models.SET_NULL, related_name='audited_by', blank=True, null=True)
 
     # Cable assets
     is_cable = models.BooleanField(default=False)
-    plug = models.ForeignKey(Connector, on_delete=models.SET_NULL,
-                             related_name='plug', blank=True, null=True)
-    socket = models.ForeignKey(Connector, on_delete=models.SET_NULL,
-                               related_name='socket', blank=True, null=True)
-    length = models.DecimalField(decimal_places=1, max_digits=10,
+    cable_type = models.ForeignKey(to=CableType, blank=True, null=True, on_delete=models.SET_NULL)
+    length = models.DecimalField(decimal_places=2, max_digits=10,
                                  blank=True, null=True, help_text='m')
     csa = models.DecimalField(decimal_places=2, max_digits=10,
-                              blank=True, null=True, help_text='mm^2')
-    circuits = models.IntegerField(blank=True, null=True)
-    cores = models.IntegerField(blank=True, null=True)
+                              blank=True, null=True, help_text='mm²')
 
     # Hidden asset_id components
     # For example, if asset_id was "C1001" then asset_id_prefix would be "C" and number "1001"
     asset_id_prefix = models.CharField(max_length=8, default="")
     asset_id_number = models.IntegerField(default=1)
 
-    def get_available_asset_id(wanted_prefix=""):
-        sql = """
-        SELECT a.asset_id_number+1
-        FROM assets_asset a
-        LEFT OUTER JOIN assets_asset b ON
-            (a.asset_id_number + 1 = b.asset_id_number AND
-            a.asset_id_prefix = b.asset_id_prefix)
-        WHERE b.asset_id IS NULL AND a.asset_id_number >= %s AND a.asset_id_prefix = %s;
-        """
-        with connection.cursor() as cursor:
-            cursor.execute(sql, [9000, wanted_prefix])
-            row = cursor.fetchone()
-            if row is None or row[0] is None:
-                return 9000
-            else:
-                return row[0]
+    reversion_perm = 'assets.asset_finance'
+
+    objects = AssetManager()
+
+    class Meta:
+        ordering = ['asset_id_prefix', 'asset_id_number']
+        permissions = [
+            ('asset_finance', 'Can see financial data for assets')
+        ]
+
+    def __str__(self):
+        return f"{self.asset_id} | {self.description}"
 
     def get_absolute_url(self):
         return reverse('asset_detail', kwargs={'pk': self.asset_id})
-
-    def __str__(self):
-        out = str(self.asset_id) + ' - ' + self.description
-        if self.is_cable:
-            out += '{} - {}m - {}'.format(self.plug, self.length, self.socket)
-        return out
 
     def clean(self):
         errdict = {}
@@ -141,36 +172,25 @@ class Asset(models.Model, RevisionMixin):
             errdict["asset_id"] = [
                 "An Asset ID can only consist of letters and numbers, with a final number"]
 
-        if self.purchase_price and self.purchase_price < 0:
-            errdict["purchase_price"] = ["A price cannot be negative"]
-
-        if self.salvage_value and self.salvage_value < 0:
-            errdict["salvage_value"] = ["A price cannot be negative"]
-
         if self.is_cable:
             if not self.length or self.length <= 0:
                 errdict["length"] = ["The length of a cable must be more than 0"]
             if not self.csa or self.csa <= 0:
                 errdict["csa"] = ["The CSA of a cable must be more than 0"]
-            if not self.circuits or self.circuits <= 0:
-                errdict["circuits"] = ["There must be at least one circuit in a cable"]
-            if not self.cores or self.cores <= 0:
-                errdict["cores"] = ["There must be at least one core in a cable"]
-            if self.socket is None:
-                errdict["socket"] = ["A cable must have a socket"]
-            if self.plug is None:
-                errdict["plug"] = ["A cable must have a plug"]
+            if not self.cable_type:
+                errdict["cable_type"] = ["A cable must have a type"]
 
         if errdict != {}:  # If there was an error when validation
             raise ValidationError(errdict)
 
+    @property
+    def activity_feed_string(self):
+        return str(self)
 
-@receiver(pre_save, sender=Asset)
-def pre_save_asset(sender, instance, **kwargs):
-    """Automatically fills in hidden members on database access"""
-    asset_search = re.search("^([a-zA-Z0-9]*?[a-zA-Z]?)([0-9]+)$", instance.asset_id)
-    if asset_search is None:
-        instance.asset_id += "1"
-    asset_search = re.search("^([a-zA-Z0-9]*?[a-zA-Z]?)([0-9]+)$", instance.asset_id)
-    instance.asset_id_prefix = asset_search.group(1)
-    instance.asset_id_number = int(asset_search.group(2))
+    @property
+    def display_id(self):
+        return str(self.asset_id)
+
+    @property
+    def display_name(self):
+        return f"{self.display_id} | {self.description}"
